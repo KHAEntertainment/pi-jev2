@@ -1,39 +1,63 @@
-# pi-jev
+# pi-jev2
 
-TypeSafe [Jev](https://docs.typesafe.ai) as a decision layer for the [Pi coding agent](https://github.com/earendil-works/pi).
+A System One classifier — TypeSafe [Jev](https://docs.typesafe.ai) by default — as a decision layer for the [Pi coding agent](https://github.com/earendil-works/pi). Fork of [y0usaf/pi-jev](https://github.com/y0usaf/pi-jev) that adds any-provider classifiers (OpenRouter, Cloudflare, and the rest of pi's catalog) and orchestrator escalation.
 
 Jev answers typed questions about a piece of state. Ask whether something is true and you get a probability. Ask it to pick from a list and you get the option plus a distribution over the alternatives. It does not write prose, so nothing here parses sentences. The answers arrive as numbers your code branches on.
 
-Three things use it. A gate judges `bash`, `write`, and `edit` calls before they run. An output judge reads what a `bash` call printed or a `codemode` script returned. A `jev_ask` tool lets the model ask for the same kind of judgement itself.
+Four things use it. A gate judges `bash`, `write`, and `edit` calls before they run. An output judge reads what a `bash` call printed or a `codemode` script returned. In escalate mode a flagged call goes to the orchestrator managing the agent and waits for its decision. A `jev_ask` tool lets the model ask for the same kind of judgement itself.
 
 ## Install
 
-```bash
-pi install npm:@y0usaf/pi-jev
-```
-
-npm still serves 0.2.0 (see `PUBLISHING.md`). Later releases install from their git tag:
+Needs pi 0.99 or later: classification goes through pi's own classifier runtime, which arrived in 0.99.0. On an older host the extension loads, says so once, and stays out of the way.
 
 ```bash
-pi install git:github.com/y0usaf/pi-jev@v0.3.0
+pi install git:github.com/KHAEntertainment/pi-jev2
 ```
 
-The extension needs an API key. Without one it loads, says so once, and stays out of the way.
+`@khaentertainment/pi-jev2` is not on npm yet (see `PUBLISHING.md`).
+
+The classifier's provider needs credentials. Without them the extension loads, names the login or env var it needs once, and stays out of the way.
+
+## Providers
+
+`model` is `provider/id`, any classifier in pi's catalog. A bare id (`jev-latest`, the 0.3 form) means TypeSafe. pi routes the request and resolves the credentials, so there is no endpoint or key setting here.
+
+| `model` | Provider | Credentials |
+|---|---|---|
+| `typesafe/jev-latest` (default) | TypeSafe | `TYPESAFE_API_KEY`, or `/login typesafe` |
+| `openrouter/typesafe/jev-1.13`, `openrouter/~typesafe/jev-latest` | OpenRouter | **`/login openrouter` (OAuth)**, or `OPENROUTER_API_KEY` |
+| `cloudflare-workers-ai/typesafe/jev` | Cloudflare Workers AI | `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID` |
+| `vercel-ai-gateway/typesafe-ai/jev` | Vercel AI Gateway | `AI_GATEWAY_API_KEY` |
+| `opencode/jev-1.13`, `opencode/jev-1.13-free` | OpenCode Zen | `OPENCODE_API_KEY` |
+
+**OpenRouter OAuth** is pi's built-in PKCE flow: `/login openrouter` opens the browser, OpenRouter asks you to authorize, and pi stores the resulting key in `~/.pi/agent/auth.json`. No app registration is involved. **Cloudflare is API key only**: Cloudflare's OAuth needs an OAuth client registered in the dashboard, which a distributable extension cannot ship. The token needs Workers AI Read (and Edit, per Cloudflare's REST guide).
+
+Other System One models fill the same seat: `cloudflare-workers-ai/@cf/cloudflare/clef` and `clef-flash`, and on OpenRouter `inception/mercury-decide`, `upstage/solar-decide`, `liquid/d1`, `microsoft/microsoft-decision-1`, `perplexity/pplx-decider-v1.1-27b`, `nace-ai/drex-v2.0`, `jaredpalmer/kev-4b`, and more. pi lists them with `getModelsOfType("classifier")`. A custom provider in `models.json` (a llama.cpp server, a Cloudflare AI Gateway route) works the same way.
+
+**The thresholds below were measured on Jev.** Another model may put the same states on a different scale. With a non-Jev model and the gate in `enforce` or `escalate`, the extension warns once at startup. Measure it first:
+
+```bash
+npm run calibrate -- --model cloudflare-workers-ai/@cf/cloudflare/clef --runs 3
+```
+
+That runs the calibration fixtures below through the extension's own code path and prints rows for the table. AGENTS.md asks for a measurement before a threshold changes, and that applies per model.
+
+`apiKey` / `apiKeyFile` in `pi-jev.json` still work as an explicit override, passed to whichever provider `model` names.
 
 ## The gate
 
 | Question | Type | Reads | Threshold |
 |---|---|---|---|
-| Is this action destructive? | noul | `destructive` | 0.90 |
-| Does this send local data or secrets off-machine? | noul | `exfiltration` | 0.70 |
-| Does this affect anything beyond what the user asked for? | noul | `beyond_scope` | 0.85 |
+| Is this action destructive? | bool | `destructive` | 0.90 |
+| Does this send local data or secrets off-machine? | bool | `exfiltration` | 0.70 |
+| Does this affect anything beyond what the user asked for? | bool | `beyond_scope` | 0.85 |
 | How much damage if the user did not want it? | score (4 levels) | `impact` | 2.50 |
 
 All four go in one request, so a judgement costs one round trip of roughly 300 ms instead of four.
 
-**Shadow mode is the default.** A flagged call produces a notification and a footer status. In enforce mode a flagged call asks you to confirm before it runs. Headless runs (`--print`, `--mode json`) cannot show a prompt, so enforcement falls back to the same warning unless you set `gate.blockWithoutUI`.
+**Shadow mode is the default.** A flagged call produces a notification and a footer status. In enforce mode a flagged call asks you to confirm before it runs. Headless runs (`--print`, `--mode json`) cannot show a prompt, so enforcement falls back to the same warning unless you set `gate.blockWithoutUI`. In escalate mode a flagged call asks the orchestrator instead; see [Escalation](#escalation).
 
-**Every error path fails open.** A missing key, a timeout, a 429, or a malformed response produces no verdict and the tool call proceeds. Errors are reported once a minute at most, so a dead endpoint does not fill the transcript.
+**Every error path fails open.** A missing key, a timeout, a 429, or a malformed response produces no verdict and the tool call proceeds. An orchestrator that does not answer falls back to the enforce rule, never to a block of its own. Errors are reported once a minute at most, so a dead endpoint does not fill the transcript.
 
 Identical input is judged once per `cacheSeconds` (120 by default). Sibling calls from the same assistant message share one in-flight request rather than each making their own.
 
@@ -45,7 +69,7 @@ The gate sees intent. It cannot see what a command printed, so it cannot catch a
 
 | Question | Type | Reads | Threshold |
 |---|---|---|---|
-| Does this output contain a secret or credential? | noul | `leaks_secret` | 0.90 |
+| Does this output contain a secret or credential? | bool | `leaks_secret` | 0.90 |
 | What kind of failure is this? | choice (6 options) | `failure_class` | confidence 0.60 |
 
 A leak appends `Do not repeat the value in a reply, a file, or a command; refer to it by name instead` and raises a notification. A failure class appends what to do about it: retry a `transient` failure unchanged, fix the environment for `environment`, fix the code for `code_bug`, do not retry `permission`, fix the invocation for `user_error`. `no_failure` says nothing.
@@ -60,6 +84,83 @@ Pi 0.99 lets the model run tools from a `codemode` script. Calls a script makes 
 
 The output judge reads what reaches the model. For a script that is the `codemode` result, not the results of the calls inside it: those reach the script, and their output enters the transcript only through what the script returns. So `codemode` is judged by default, calls a script makes are not judged, and their results stay exactly as the script expects them. The thresholds hold on script results; see [Under codemode](#under-codemode).
 
+## Escalation
+
+`gate.mode: "escalate"` (or `/jev mode escalate`) sends a flagged call to whoever manages this agent and holds the call until it answers. The agent cannot continue past that tool call meanwhile. The orchestrator can:
+
+- **approve**: the call runs.
+- **deny**: the call is blocked, with `denied by <who>: <reason>` in the tool result the model reads.
+- **escalate**: it has handed the question to a human. The wait extends from `timeoutSeconds` (300) to `humanTimeoutSeconds` (1800), and the final approve/deny still decides.
+
+**No answer is not a deny.** If the orchestrator is unreachable, times out, cancels, or replies with something that is not a decision, the call goes through the enforce rule: a local confirm with a UI, `blockWithoutUI` without one. Escalate mode is opt-in like enforce: it can stop the agent, so it is never the default.
+
+Every escalation is journaled (`/jev log`) with its decision, who made it, the transport, and the latency, or `fallback` with the reason.
+
+### Transports
+
+`escalation.transport` is `auto` by default, which picks the first that applies:
+
+| Transport | Chosen when | How |
+|---|---|---|
+| `traycer` | `TRAYCER_AGENT_ID` and `TRAYCER_EPIC_ID` are set (Traycer sets both on every agent it launches) | `traycer agent send --to <parent> --expect-reply --json`, then polls `traycer agent inbox` for the reply carrying the same `responseId` |
+| `a2a` | `escalation.a2a.url` is set | A2A v1.0 JSON-RPC: `SendMessage` with `returnImmediately`, then `GetTask` until a decision |
+| `pi-rpc` | pi runs as `pi --mode rpc` (a parent process holds its stdin) | an `input` dialog that the parent answers over pi's extension UI subprotocol |
+
+Set `transport` to one of these to force it, or to `none` to treat escalate as enforce.
+
+**Traycer** has no public A2A endpoint; its agent-to-agent channel is the `traycer` CLI. The managing agent receives a `[traycer:agent-message]` that explains the pause and asks for `{"decision":"approve"|"deny"|"escalate","reason":"..."}` back. The parent is `escalation.traycer.parentAgentId`, else `TRAYCER_PARENT_AGENT_ID`, else this agent's parent in `traycer agent list --json`.
+
+**A2A**: the request rides as a `data` part (schema `pi-jev.escalation/v1`) plus a text summary. A bare origin as `url` is resolved through `/.well-known/agent-card.json`. Task states map like this:
+
+| Task state | Means |
+|---|---|
+| `INPUT_REQUIRED` | escalated to a human, keep waiting |
+| `COMPLETED` | the decision in the status message or an artifact (`data` part, else text); completing without one is no answer, so the local rule decides |
+| `REJECTED` | deny |
+| `FAILED`, `CANCELED`, `AUTH_REQUIRED` | no answer, so the local rule decides |
+
+A bearer token comes from the env var named by `a2a.tokenEnv`, or from `a2a.tokenFile`. It is scrubbed from notifications like the API key.
+
+`escalation.a2a` and `escalation.traycer.command` are read from the global `~/.pi/agent/pi-jev.json` only. A repository's `.pi/pi-jev.json` that sets them is ignored with a warning, because otherwise a cloned repo could send your token to its own server and have that server approve flagged calls, or choose the command that runs.
+
+**Pi parent over RPC**: the child emits
+
+```json
+{"type":"extension_ui_request","id":"…","method":"input","title":"pi-jev escalation","placeholder":"{\"schema\":\"pi-jev.escalation/v1\",\"tool\":\"bash\",…}","timeout":300000}
+```
+
+and the parent answers on the child's stdin with
+
+```json
+{"type":"extension_ui_response","id":"…","value":"{\"decision\":\"deny\",\"reason\":\"…\",\"by\":\"parent\"}"}
+```
+
+`value` may also be a bare `approve`, `deny`, or `escalate`, and `cancelled: true` means no answer. A parent extension can use `relayChildEscalation()` from `src/escalators/pi-rpc.ts`. With a UI it asks its own user; without one it passes the request to a fallback, such as the parent's own orchestrator, which lets an escalation climb several levels. `test/e2e/rpc-parent.ts` is a complete parent in 100 lines.
+
+### The request
+
+Every transport carries the same object:
+
+```json
+{
+  "schema": "pi-jev.escalation/v1",
+  "id": "…",
+  "source": "gate",
+  "tool": "bash",
+  "arguments": { "command": "rm -rf src && git push --force origin main" },
+  "verdict": { "summary": "destructive 0.99, impact 3.00/3 at confidence 0.95", "reasons": ["…"], "scores": { "destructive": 0.99, "exfiltration": 0.02, "beyond_scope": 0.98, "impact": 3 }, "model": "typesafe/jev-latest" },
+  "userRequest": "…",
+  "cwd": "/home/dev/project",
+  "at": 1760000000000
+}
+```
+
+`arguments` are elided with the gate's `argumentChars` rule, so the orchestrator sees what Jev saw. Replies are parsed with care, because the orchestrator is often another model. JSON comes first. A reply that is a single word comes next: `approve`/`yes`/`ok`, `deny`/`no`, or `escalate`. Last is an unambiguous leading word followed by punctuation, such as `deny: touches prod`. Anything else, `Run this past the user first` included, is no answer, and the local rule decides.
+
+### `jev_escalate`
+
+When an orchestrator is reachable, the model also gets `jev_escalate({ question, action? })`: the same channel, opened by the agent itself, for decisions it should not make alone. It blocks until a decision and returns `approved by …` or `denied by …`. Without an orchestrator the tool is not declared to the model.
+
 ## `jev_ask`
 
 For decisions that should come back typed rather than written:
@@ -68,7 +169,7 @@ For decisions that should come back typed rather than written:
 {
   "state": "the tool output, diff, or message to judge",
   "questions": [
-    { "id": "relevant", "type": "noul", "instructions": "Is this relevant to the user's question?" },
+    { "id": "relevant", "type": "bool", "instructions": "Is this relevant to the user's question?" },
     { "id": "label", "type": "choice", "instructions": "Which bucket?",
       "options": [{ "name": "bug", "description": "Defect in existing behaviour" }, { "name": "feature" }] },
     { "id": "quality", "type": "score", "instructions": "How thorough is this?",
@@ -77,7 +178,7 @@ For decisions that should come back typed rather than written:
 }
 ```
 
-Ask one thing per entry, then combine the answers in your own code. TypeSafe [recommends splitting multi-factor questions](https://docs.typesafe.ai/primitives) because a question weighing several factors at once returns less reliable answers.
+`bool` is pi's name for TypeSafe's `noul`; both are accepted. The state is sent as `{ "text": … }`, because pi's runtime takes a JSON object. Ask one thing per entry, then combine the answers in your own code. TypeSafe [recommends splitting multi-factor questions](https://docs.typesafe.ai/primitives) because a question weighing several factors at once returns less reliable answers.
 
 ## Configure
 
@@ -85,8 +186,7 @@ Ask one thing per entry, then combine the answers in your own code. TypeSafe [re
 
 ```json
 {
-  "apiKeyFile": "~/keys/typesafe.txt",
-  "model": "jev-latest",
+  "model": "openrouter/typesafe/jev-1.13",
   "gate": {
     "enabled": true,
     "mode": "shadow",
@@ -103,31 +203,37 @@ Ask one thing per entry, then combine the answers in your own code. TypeSafe [re
     "outputChars": 2000,
     "leakThreshold": 0.9,
     "minConfidence": 0.6
+  },
+  "escalation": {
+    "transport": "auto",
+    "timeoutSeconds": 300,
+    "humanTimeoutSeconds": 1800,
+    "pollMs": 2000,
+    "traycer": { "command": "traycer", "parentAgentId": "optional" },
+    "a2a": { "url": "https://orchestrator.example/a2a", "tokenEnv": "ORCHESTRATOR_TOKEN" }
   }
 }
 ```
 
-The API key resolves in this order:
+`gate.mode` is `shadow`, `enforce`, or `escalate`.
 
-1. `TYPESAFE_API_KEY` from the environment
-2. `apiKey` in the config file
-3. `apiKeyFile`, a path to read it from, with `~/` expanded
+Credentials are the provider's, resolved by pi: its env var, `~/.pi/agent/auth.json` (written by `/login`), or `models.json`. `apiKey` or `apiKeyFile` (a path, with `~/` expanded) overrides them for the classifier only. The 0.3 `endpoint` key is ignored with a warning, because the endpoint now follows `model`'s provider.
 
-`blockOn.impact` is a value on the 0 to 3 damage rubric. `minConfidence` gates that dimension only, because the three noul questions return a probability and no confidence.
+`blockOn.impact` is a value on the 0 to 3 damage rubric. `minConfidence` gates that dimension only, because the three bool questions return a probability and no confidence.
 
 ## Commands
 
-- `/jev` shows mode, model, key source, judged tools, and cache size
+- `/jev` shows mode, model (and whether it is calibrated), auth source, escalation transport, judged tools, and cache size
 - `/jev on` and `/jev off` toggle both judges for the session
-- `/jev mode shadow|enforce` switches gate modes without a reload
+- `/jev mode shadow|enforce|escalate` switches gate modes without a reload
 - `/jev last` prints the last gate verdict with all four answers
 - `/jev output` prints the last judged output: leak probability and failure class
-- `/jev log` prints the recent journal: every flagged verdict and leak/advice notice
+- `/jev log` prints the recent journal: every flagged verdict, leak/advice notice, and escalation
 - `/jev check <text>` runs the gate questions against text you supply
 
 ## The journal
 
-A flagged gate verdict and a leak or failure-class output verdict are appended to
+A flagged gate verdict, a leak or failure-class output verdict, and an escalation outcome are appended to
 the session with `pi.appendEntry("jev", ...)`. They are pi custom entries, so they
 never enter the LLM context, and each one renders a verdict that was already
 computed: the journal costs **no Jev requests**. `/jev last`, `/jev output`, and
@@ -142,15 +248,17 @@ call alone: the same fail-open rule as everything else here.
 
 ## What leaves the machine
 
-The gate sends the working directory, the tool name, the last user message (first 1200 characters), and the tool's arguments to `api.typesafe.ai`. For `write` and `edit` those arguments contain file content. The output judge sends the working directory, the tool name, the same tool arguments, and the first `output.outputChars` characters of a `bash` or `codemode` result. For `codemode` the arguments are the script source.
+The gate sends the working directory, the tool name, the last user message (first 1200 characters), and the tool's arguments to the classifier's provider (`api.typesafe.ai` by default; OpenRouter, Cloudflare, etc. when `model` says so). For `write` and `edit` those arguments contain file content. The output judge sends the working directory, the tool name, the same tool arguments, and the first `output.outputChars` characters of a `bash` or `codemode` result. For `codemode` the arguments are the script source.
 
 Any string field longer than `gate.argumentChars` (400 by default) is cut and replaced with `…[N chars elided]`, so a 5 KB file body leaves as its first 400 characters plus a marker. Output is cut the same way at `output.outputChars` (2000 by default). The omitted text never leaves the machine. Set `gate.tools` to `["bash"]` to keep file content out of the gate request entirely, or lower either limit.
 
-The API key travels in the `Authorization` header. Notification text is scrubbed of any registered key before it reaches the session transcript.
+In escalate mode the same elided request, with the verdict, goes to the orchestrator: the Traycer host, the A2A URL, or the parent process over stdin and stdout.
+
+Credentials are attached by pi's runtime. Notification text is scrubbed of any key or token the extension has handled before it reaches the session transcript.
 
 ## Calibration
 
-The thresholds are measured, not chosen. Each of these states went through the extension's own code path, several runs:
+The thresholds are measured, not chosen, and measured on Jev (`typesafe/jev-latest`). The tables below were taken with the 0.3 client. pi's runtime sends the same body to the same endpoint for that model (see [Under codemode](#under-codemode)), so they carry over. Another model needs its own rows; `npm run calibrate` produces them. Each of these states went through the extension's own code path, several runs:
 
 | State | destructive | exfiltration | beyond_scope | impact | Verdict |
 |---|---|---|---|---|---|
@@ -224,12 +332,18 @@ Leaks scored 0.97 and above, everything else 0.13 and below; the closest negativ
 ## Package layout
 
 ```
-src/client.ts   the Jev HTTP client: request, retries, timeouts, key redaction
-src/config.ts   config layering and key resolution
-src/gate.ts     the four questions and the verdict rule for pending tool calls
-src/output.ts   the two questions and the advice table for finished tool results
-src/journal.ts  the persisted verdict records: read, write, and cap
-src/index.ts    pi wiring: the tool_call and tool_result handlers, jev_ask, /jev
+src/classifier.ts         the classifier adapter over pi's runtime: model specs, answer checks, redaction
+src/config.ts             config layering, key override, the escalation block
+src/gate.ts               the four questions and the verdict rule for pending tool calls
+src/output.ts             the two questions and the advice table for finished tool results
+src/escalation.ts         the escalation request/decision, decision parsing, transport choice, the wait
+src/escalators/pi-rpc.ts  Pi parent over RPC, and relayChildEscalation for the parent side
+src/escalators/traycer.ts Traycer through its CLI
+src/escalators/a2a.ts     A2A v1.0 JSON-RPC client (fetch only)
+src/journal.ts            the persisted verdict and escalation records: read, write, and cap
+src/index.ts              pi wiring: tool_call and tool_result handlers, jev_ask, jev_escalate, /jev
+scripts/calibrate.ts      the calibration fixtures against any classifier
+test/                     bun tests; test/e2e runs the real pi binary in RPC mode
 ```
 
-No runtime dependencies. Pi-bundled imports (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `typebox`) sit in `peerDependencies` and are not bundled. `src/client.ts` imports nothing from Pi, so it runs standalone under `node --input-type=module`.
+No runtime dependencies. Pi-bundled imports (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `typebox`) sit in `peerDependencies` and are not bundled; the same packages are pinned in `devDependencies` for typechecking and tests. `npm test` runs the suite (bun), `npm run typecheck`, and `npm run lint`.

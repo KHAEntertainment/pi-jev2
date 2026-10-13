@@ -16,6 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { GateVerdict } from "./gate";
 import { describeAnswers, summarizeVerdict } from "./gate";
 import type { OutputVerdict } from "./output";
+import type { EscalationOutcome } from "./escalation";
 
 /** Exactly this customType identifies our entries; anything else is not ours. */
 export const JOURNAL_TYPE = "jev";
@@ -52,7 +53,21 @@ export interface OutputRecord {
 	classConfidence: number | undefined;
 }
 
-export type JournalRecord = GateRecord | OutputRecord;
+/** An escalated call and what the orchestrator (or the fallback) decided. */
+export interface EscalationRecord {
+	kind: "escalation";
+	at: number;
+	tool: string;
+	/** approve / deny from the orchestrator, or fallback when it gave no answer. */
+	decision: "approve" | "deny" | "fallback";
+	transport: string;
+	by: string | undefined;
+	reason: string | undefined;
+	viaHuman: boolean;
+	latencyMs: number;
+}
+
+export type JournalRecord = GateRecord | OutputRecord | EscalationRecord;
 
 export function gateRecord(
 	tool: string,
@@ -65,6 +80,37 @@ export function gateRecord(
 		tool,
 		summary: summarizeVerdict(verdict),
 		answers: describeAnswers({ answers: verdict.answers }),
+	};
+}
+
+export function escalationRecord(
+	tool: string,
+	outcome: EscalationOutcome | { fallback: string; transport: string; latencyMs: number },
+	at: number,
+): EscalationRecord {
+	if ("fallback" in outcome) {
+		return {
+			kind: "escalation",
+			at,
+			tool,
+			decision: "fallback",
+			transport: outcome.transport,
+			by: undefined,
+			reason: outcome.fallback,
+			viaHuman: false,
+			latencyMs: outcome.latencyMs,
+		};
+	}
+	return {
+		kind: "escalation",
+		at,
+		tool,
+		decision: outcome.decision,
+		transport: outcome.transport,
+		by: outcome.by,
+		reason: outcome.reason,
+		viaHuman: outcome.viaHuman,
+		latencyMs: outcome.latencyMs,
 	};
 }
 
@@ -89,6 +135,12 @@ export function outputRecord(
 export function describeRecord(record: JournalRecord): string {
 	if (record.kind === "gate") {
 		return `${record.tool} - ${record.summary} | ${record.answers}`;
+	}
+	if (record.kind === "escalation") {
+		const who = record.by ? ` by ${record.by}` : "";
+		const human = record.viaHuman ? " via human" : "";
+		const reason = record.reason ? `: ${record.reason}` : "";
+		return `${record.tool} - ${record.decision}${who}${human} over ${record.transport} in ${(record.latencyMs / 1000).toFixed(1)}s${reason}`;
 	}
 	return `${record.tool} - ${record.notice} | leak ${record.leaksSecret.toFixed(2)} | class ${record.failureClass ?? "none"} at ${record.classConfidence?.toFixed(2) ?? "n/a"}`;
 }
@@ -181,6 +233,28 @@ export function parseRecord(value: unknown): JournalRecord | undefined {
 				typeof classConfidence === "number" && Number.isFinite(classConfidence)
 					? classConfidence
 					: undefined,
+		};
+	}
+	if (kind === "escalation") {
+		const decision = Reflect.get(value, "decision");
+		const transport = Reflect.get(value, "transport");
+		const latencyMs = Reflect.get(value, "latencyMs");
+		if (decision !== "approve" && decision !== "deny" && decision !== "fallback") {
+			return undefined;
+		}
+		if (typeof transport !== "string") return undefined;
+		const by = Reflect.get(value, "by");
+		const reason = Reflect.get(value, "reason");
+		return {
+			kind: "escalation",
+			at,
+			tool,
+			decision,
+			transport,
+			by: typeof by === "string" ? by : undefined,
+			reason: typeof reason === "string" ? reason : undefined,
+			viaHuman: Reflect.get(value, "viaHuman") === true,
+			latencyMs: typeof latencyMs === "number" && Number.isFinite(latencyMs) ? latencyMs : 0,
 		};
 	}
 	return undefined;

@@ -1,9 +1,10 @@
 /**
  * Config for the Jev extensions.
  *
- * Transport settings (endpoint, model, key, timeout) live here because this is
- * the only place that talks to the API, and the key should be resolved in
- * exactly one place.
+ * Which classifier answers, and how flagged calls escalate, live here. The
+ * provider's endpoint and credentials do not: pi's model runtime resolves both
+ * from the model spec (env, auth.json, `/login`), so this file only carries an
+ * optional key override.
  *
  * Layering: built-in defaults <- ~/.pi/agent/pi-jev.json <- <cwd>/.pi/pi-jev.json.
  * Project settings win. Only keys actually present in a file override, so a
@@ -12,33 +13,49 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import * as host from "@earendil-works/pi-coding-agent";
 import {
-	DEFAULT_ENDPOINT,
 	DEFAULT_MODEL,
 	DEFAULT_RETRIES,
 	DEFAULT_TIMEOUT_MS,
-} from "./client";
+	parseModelSpec,
+} from "./classifier";
 
 export const CONFIG_FILE = "pi-jev.json";
-export const API_KEY_ENV = "TYPESAFE_API_KEY";
 
 /**
- * The host module's exports as plain data.
- *
- * The extension needs the host's config dir name, and the host does not export
- * that name before 0.79.7: importing it there binds `undefined`, which reached
- * `join` and killed the agent at startup. Reading it off this view keeps the
- * lookup optional instead of a named import that a host may not have.
+ * The host's per-project config dir name, read off a plain-data view of its
+ * exports. Hosts before 0.79.7 do not export it, and a named import there
+ * binds `undefined` and kills the agent at startup (upstream issue #1). Such
+ * a host also has no classifier runtime, so the extension must load far
+ * enough to say "needs pi 0.99" and stay inactive; `.pi` is the default name.
  */
-const HOST_EXPORTS: Record<string, unknown> = { ...host };
+function configDirName(): string {
+	const exports: Record<string, unknown> = { ...host };
+	const name = exports.CONFIG_DIR_NAME;
+	return typeof name === "string" && name.length > 0 ? name : ".pi";
+}
 
-/** shadow reports but never blocks; enforce can block a tool call. */
-export type GateMode = "shadow" | "enforce";
+/**
+ * shadow reports but never blocks; enforce asks the local user; escalate asks
+ * the orchestrator (Pi parent, Traycer, A2A) and falls back to enforce when it
+ * cannot answer.
+ */
+export type GateMode = "shadow" | "enforce" | "escalate";
+export const GATE_MODES: readonly GateMode[] = ["shadow", "enforce", "escalate"];
+
+export type EscalationTransport = "auto" | "pi-rpc" | "traycer" | "a2a" | "none";
+const TRANSPORTS: readonly EscalationTransport[] = [
+	"auto",
+	"pi-rpc",
+	"traycer",
+	"a2a",
+	"none",
+];
 
 export interface GateThresholds {
-	/** Noul probability at or above which the dimension counts as triggered. */
+	/** Bool probability at or above which the dimension counts as triggered. */
 	destructive: number;
 	exfiltration: number;
 	beyondScope: number;
@@ -77,21 +94,56 @@ export interface OutputConfig {
 	tools: string[];
 	/** Elide output longer than this from the state sent to Jev. */
 	outputChars: number;
-	/** Noul probability at or above which output counts as carrying a secret. */
+	/** Bool probability at or above which output counts as carrying a secret. */
 	leakThreshold: number;
 	/** Minimum confidence on the failure class before advice is attached. */
 	minConfidence: number;
 }
 
+export interface TraycerConfig {
+	/** CLI to run. Traycer installs it as `traycer`. */
+	command: string;
+	/** Agent to escalate to. Falls back to TRAYCER_PARENT_AGENT_ID, then lookup. */
+	parentAgentId: string | undefined;
+}
+
+export interface A2AConfig {
+	/** JSON-RPC endpoint, or a base URL whose agent card names one. */
+	url: string | undefined;
+	/** Env var holding a bearer token for the orchestrator. */
+	tokenEnv: string | undefined;
+	/** File holding a bearer token, with `~/` expanded. */
+	tokenFile: string | undefined;
+}
+
+/**
+ * Where a flagged call goes in `escalate` mode. Every failure - no transport,
+ * unreachable orchestrator, timeout - falls back to `enforce` behaviour, so an
+ * orchestrator outage never blocks more than the local rule would.
+ */
+export interface EscalationConfig {
+	transport: EscalationTransport;
+	/** How long to wait for a first decision. */
+	timeoutSeconds: number;
+	/** How long to keep waiting once the orchestrator hands it to a human. */
+	humanTimeoutSeconds: number;
+	/** Poll interval for transports without push (Traycer inbox, A2A GetTask). */
+	pollMs: number;
+	traycer: TraycerConfig;
+	a2a: A2AConfig;
+}
+
 export interface JevConfig {
-	endpoint: string;
+	/** `provider/id` of the classifier, e.g. `openrouter/typesafe/jev-1.13`. */
 	model: string;
+	/** Optional key override; pi resolves the provider's credentials otherwise. */
 	apiKey: string | undefined;
 	apiKeyFile: string | undefined;
 	timeoutMs: number;
 	retries: number;
 	gate: GateConfig;
 	output: OutputConfig;
+	escalation: EscalationConfig;
 }
 
 export interface LoadedJevConfig {
@@ -106,14 +158,21 @@ interface ParsedGate extends Partial<Omit<GateConfig, "blockOn">> {
 
 type ParsedOutput = Partial<OutputConfig>;
 
-interface ParsedConfigFile extends Partial<Omit<JevConfig, "gate" | "output">> {
+interface ParsedEscalation
+	extends Partial<Omit<EscalationConfig, "traycer" | "a2a">> {
+	traycer?: Partial<TraycerConfig>;
+	a2a?: Partial<A2AConfig>;
+}
+
+interface ParsedConfigFile
+	extends Partial<Omit<JevConfig, "gate" | "output" | "escalation">> {
 	gate?: ParsedGate;
 	output?: ParsedOutput;
+	escalation?: ParsedEscalation;
 }
 
 export function defaultJevConfig(): JevConfig {
 	return {
-		endpoint: DEFAULT_ENDPOINT,
 		model: DEFAULT_MODEL,
 		apiKey: undefined,
 		apiKeyFile: undefined,
@@ -136,28 +195,15 @@ export function defaultJevConfig(): JevConfig {
 			leakThreshold: 0.9,
 			minConfidence: 0.6,
 		},
+		escalation: {
+			transport: "auto",
+			timeoutSeconds: 300,
+			humanTimeoutSeconds: 1800,
+			pollMs: 2000,
+			traycer: { command: "traycer", parentAgentId: undefined },
+			a2a: { url: undefined, tokenEnv: undefined, tokenFile: undefined },
+		},
 	};
-}
-
-/**
- * Name of the host's per-project config directory.
- *
- * The host's own export wins whenever it exists (every host from 0.79.7 on,
- * and the only answer that stays exact when `PI_CODING_AGENT_DIR` moves the
- * agent dir elsewhere). Hosts before that export no name at all, but they do
- * export `getAgentDir()`, and they keep the agent dir inside the same config
- * dir they read per project (`<config dir>/agent`) — so the name can be read
- * off the host's own layout rather than restated here.
- *
- * Caveat for those older hosts: with the agent dir overridden to a path outside
- * that layout, the parent directory is a user choice rather than the config dir
- * name, and a project config file can be missed. No public host on that range
- * reports the name, so this is the closest the extension can get there.
- */
-export function configDirName(): string {
-	const exported = HOST_EXPORTS.CONFIG_DIR_NAME;
-	if (typeof exported === "string" && exported.length > 0) return exported;
-	return basename(dirname(host.getAgentDir()));
 }
 
 export function loadJevConfig(cwd: string): LoadedJevConfig {
@@ -165,6 +211,7 @@ export function loadJevConfig(cwd: string): LoadedJevConfig {
 	const warnings: string[] = [];
 	const global = readConfigFile(join(host.getAgentDir(), CONFIG_FILE), warnings);
 	const project = readConfigFile(join(cwd, configDirName(), CONFIG_FILE), warnings);
+	restrictProjectEscalation(project, warnings);
 
 	const config: JevConfig = {
 		...defaults,
@@ -188,26 +235,51 @@ export function loadJevConfig(cwd: string): LoadedJevConfig {
 			tools:
 				project.output?.tools ?? global.output?.tools ?? defaults.output.tools,
 		},
+		escalation: {
+			...defaults.escalation,
+			...global.escalation,
+			...project.escalation,
+			traycer: {
+				...defaults.escalation.traycer,
+				...global.escalation?.traycer,
+				...project.escalation?.traycer,
+			},
+			a2a: {
+				...defaults.escalation.a2a,
+				...global.escalation?.a2a,
+				...project.escalation?.a2a,
+			},
+		},
 	};
+	// A bare id keeps meaning TypeSafe; store the qualified form so status
+	// lines and journal records name the provider.
+	const spec = parseModelSpec(config.model);
+	config.model = `${spec.provider}/${spec.id}`;
 
 	const key = resolveApiKey(config, warnings);
 	return { config: { ...config, apiKey: key }, warnings };
 }
 
 /**
- * Env wins over config, so a host can inject the key without touching files.
+ * An explicit override only. Without one, pi resolves the provider's own
+ * credentials (its env var, auth.json, `/login`), so nothing here reads env.
  * apiKeyFile supports "~/" because keys usually live outside the repo.
  */
 export function resolveApiKey(
 	config: Pick<JevConfig, "apiKey" | "apiKeyFile">,
 	warnings: string[] = [],
 ): string | undefined {
-	const fromEnv = process.env[API_KEY_ENV]?.trim();
-	if (fromEnv) return fromEnv;
 	if (config.apiKey?.trim()) return config.apiKey.trim();
 	if (!config.apiKeyFile) return undefined;
+	return readSecretFile(config.apiKeyFile, warnings);
+}
 
-	const path = expandHome(config.apiKeyFile);
+/** A one-line secret from a file, or undefined with a warning on failure. */
+export function readSecretFile(
+	file: string,
+	warnings: string[] = [],
+): string | undefined {
+	const path = expandHome(file);
 	try {
 		const contents = readFileSync(path, "utf8").trim();
 		return contents.length > 0 ? contents : undefined;
@@ -255,8 +327,6 @@ function readConfigFile(path: string, warnings: string[]): ParsedConfigFile {
 
 	const out: ParsedConfigFile = {};
 
-	const endpoint = asString(Reflect.get(parsed, "endpoint"));
-	if (endpoint) out.endpoint = endpoint;
 	const model = asString(Reflect.get(parsed, "model"));
 	if (model) out.model = model;
 	const apiKey = asString(Reflect.get(parsed, "apiKey"));
@@ -274,7 +344,7 @@ function readConfigFile(path: string, warnings: string[]): ParsedConfigFile {
 		const enabled = Reflect.get(gate, "enabled");
 		if (typeof enabled === "boolean") parsedGate.enabled = enabled;
 		const mode = Reflect.get(gate, "mode");
-		if (mode === "shadow" || mode === "enforce") parsedGate.mode = mode;
+		if (GATE_MODES.includes(mode as GateMode)) parsedGate.mode = mode as GateMode;
 		const tools = asToolNames(Reflect.get(gate, "tools"));
 		if (tools) parsedGate.tools = tools;
 		const cacheSeconds = asNonNegativeInt(Reflect.get(gate, "cacheSeconds"));
@@ -322,8 +392,81 @@ function readConfigFile(path: string, warnings: string[]): ParsedConfigFile {
 		out.output = parsedOutput;
 	}
 
+	const escalation = Reflect.get(parsed, "escalation");
+	if (typeof escalation === "object" && escalation !== null) {
+		out.escalation = parseEscalation(escalation);
+	}
+
 	for (const key of ignoredKeys(parsed, out)) {
-		warnings.push(`${path}: ignored ${key} (unknown key or unusable value)`);
+		warnings.push(`${path}: ignored ${key} (${IGNORED_HINTS[key] ?? "unknown key or unusable value"})`);
+	}
+	return out;
+}
+
+/**
+ * A repository's own `.pi/pi-jev.json` must not choose where escalations go or
+ * what runs: an A2A URL plus `tokenEnv`/`tokenFile` would send a local secret
+ * as a bearer token to a server that can then approve flagged calls, and the
+ * Traycer command is executed. Those come from the user's global file only.
+ */
+function restrictProjectEscalation(project: ParsedConfigFile, warnings: string[]): void {
+	const escalation = project.escalation;
+	if (!escalation) return;
+	if (escalation.a2a) {
+		delete escalation.a2a;
+		warnings.push(
+			"project pi-jev.json: escalation.a2a is ignored; set it in the global ~/.pi/agent/pi-jev.json",
+		);
+	}
+	if (escalation.traycer?.command) {
+		delete escalation.traycer.command;
+		warnings.push(
+			"project pi-jev.json: escalation.traycer.command is ignored; set it in the global ~/.pi/agent/pi-jev.json",
+		);
+	}
+}
+
+/** Keys 0.3 understood, with what replaced them. */
+const IGNORED_HINTS: Record<string, string> = {
+	endpoint:
+		"the endpoint now follows the model's provider; set model to provider/id, e.g. openrouter/typesafe/jev-1.13",
+};
+
+function parseEscalation(raw: object): ParsedEscalation {
+	const out: ParsedEscalation = {};
+	const transport = Reflect.get(raw, "transport");
+	if (TRANSPORTS.includes(transport as EscalationTransport)) {
+		out.transport = transport as EscalationTransport;
+	}
+	const timeoutSeconds = asPositiveInt(Reflect.get(raw, "timeoutSeconds"));
+	if (timeoutSeconds !== undefined) out.timeoutSeconds = timeoutSeconds;
+	const humanTimeoutSeconds = asPositiveInt(Reflect.get(raw, "humanTimeoutSeconds"));
+	if (humanTimeoutSeconds !== undefined) {
+		out.humanTimeoutSeconds = humanTimeoutSeconds;
+	}
+	const pollMs = asPositiveInt(Reflect.get(raw, "pollMs"));
+	if (pollMs !== undefined) out.pollMs = pollMs;
+
+	const traycer = Reflect.get(raw, "traycer");
+	if (typeof traycer === "object" && traycer !== null) {
+		const parsed: Partial<TraycerConfig> = {};
+		const command = asString(Reflect.get(traycer, "command"));
+		if (command) parsed.command = command;
+		const parentAgentId = asString(Reflect.get(traycer, "parentAgentId"));
+		if (parentAgentId) parsed.parentAgentId = parentAgentId;
+		out.traycer = parsed;
+	}
+
+	const a2a = Reflect.get(raw, "a2a");
+	if (typeof a2a === "object" && a2a !== null) {
+		const parsed: Partial<A2AConfig> = {};
+		const url = asString(Reflect.get(a2a, "url"));
+		if (url && /^https?:\/\//.test(url)) parsed.url = url;
+		const tokenEnv = asString(Reflect.get(a2a, "tokenEnv"));
+		if (tokenEnv) parsed.tokenEnv = tokenEnv;
+		const tokenFile = asString(Reflect.get(a2a, "tokenFile"));
+		if (tokenFile) parsed.tokenFile = tokenFile;
+		out.a2a = parsed;
 	}
 	return out;
 }

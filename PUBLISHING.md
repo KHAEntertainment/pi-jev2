@@ -1,5 +1,26 @@
 # Publishing
 
+> **Fork note (0.4.0).** This repository now publishes `@khaentertainment/pi-jev2`
+> from `KHAEntertainment/pi-jev2`. None of the steps below has been done for
+> the new name yet. They go in this order:
+>
+> 1. **Create the `@khaentertainment` scope** on npmjs.com, as a user or an organization.
+> 2. **Bootstrap the package with one authenticated publish.** npm can configure a
+>    trusted publisher only for a package that already exists. From the owner's
+>    machine, logged in with 2FA (a passkey or security key), run
+>    `npm publish --access public` on the release commit. Do not use a bypass
+>    token: as the history below explains, npm restricts them for direct
+>    publishing.
+> 3. **Configure the trusted publisher** on the package's settings page: user
+>    `KHAEntertainment`, repository `pi-jev2`, workflow `publish.yml`, environment
+>    empty. Then set publishing access to "Require two-factor authentication and
+>    disallow tokens".
+> 4. **Later releases publish from the GitHub release workflow** with no secret.
+>
+> The history below is upstream's, kept for the method. When following it, read
+> `@y0usaf/pi-jev` as `@khaentertainment/pi-jev2` and `y0usaf`/`pi-jev` as
+> `KHAEntertainment`/`pi-jev2`.
+
 npm has one durable route left for this package: trusted publishing (OIDC) from
 `.github/workflows/publish.yml`. Classic tokens were revoked in November 2025,
 TOTP 2FA is retired, and tokens that bypass 2FA are now restricted for direct

@@ -1,5 +1,10 @@
 # What to add next
 
+> **Fork (pi-jev2), 2026-10-13.** The "classifier runtime" item below shipped as
+> 0.4.0 together with orchestrator escalation; see `docs/SESSION-NOTES.md` for
+> what was decided, what is verified, and the fork's own queue. The rest of this
+> file is upstream's plan as of 0.3.0 and still applies.
+
 Decided 2026-09-19. This settles the question left open on 2026-09-17 ("what else
 can we add to it?"), from the two read-only surveys in
 `~/dev/sandbox/*/pi-jev-*/report.md` and the owner's own probe of ten candidate
@@ -34,7 +39,14 @@ the existing, measured `leaks_secret` question against the assistant's own text
 - Clear the taint flag on `agent_settled` so it cannot stick.
 - Honest limit: `message_end` cannot redact, so this is a warning, not a fix.
 
-## Queued: Jev requests through pi's classifier runtime
+## Shipped in 0.4.0 (fork): Jev requests through pi's classifier runtime
+
+Done as planned below, plus orchestrator escalation. `src/client.ts`, the
+`endpoint` knob and the `configDirName()` fallback are gone; a host without
+`modelRegistry.classify` gets a load-time notice. AGENTS.md's "fetch plus types"
+rule changed with it.
+
+Original plan:
 
 pi 0.99 ships a `typesafe` provider and `ctx.modelRegistry.classify()`. It sends
 the same body (`{ model, state, questions }`) to the same endpoint

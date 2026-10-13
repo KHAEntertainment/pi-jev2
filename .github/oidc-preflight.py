@@ -20,7 +20,7 @@ AUDIENCE = "npm:registry.npmjs.org"
 # Mirrors lib/utils/oidc.js in the npm CLI: the GitHub OIDC token is presented
 # as the Authorization bearer to the per-package exchange endpoint.
 EXCHANGE = "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/{}"
-PACKAGE = "@y0usaf/pi-jev"
+PACKAGE = "@khaentertainment/pi-jev2"
 
 
 def mint() -> str:

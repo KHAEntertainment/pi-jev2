@@ -15,11 +15,12 @@
 
 import {
 	answerFor,
+	boolValue,
 	confidenceFor,
 	type JevQuestion,
 	type JevResponse,
 	type JevState,
-} from "./client";
+} from "./classifier";
 import type { JevConfig } from "./config";
 import { elide, summarizeArguments } from "./gate";
 
@@ -53,7 +54,7 @@ export interface OutputVerdict {
  */
 export const OUTPUT_QUESTIONS: Record<string, JevQuestion> = {
 	leaks_secret: {
-		type: "noul",
+		type: "bool",
 		instructions:
 			"Does `output` contain a secret or credential that must not be written to a session transcript?",
 		criteria: {
@@ -98,21 +99,21 @@ export function outputKey(toolName: string, output: string): string {
 }
 
 export function buildOutputState(input: OutputInput): JevState {
-	return {
+	const state: Record<string, unknown> = {
 		cwd: input.cwd,
 		tool: input.toolName,
 		is_error: input.isError,
 		arguments: summarizeArguments(input.input, input.argumentChars),
 		output: elide(input.output, input.outputChars),
 	};
+	return state as JevState;
 }
 
 export function evaluateOutput(
 	response: JevResponse,
 	config: JevConfig,
 ): OutputVerdict {
-	const leak = answerFor(response, "leaks_secret");
-	const leaksSecret = leak?.type === "noul" ? leak.noul : 0;
+	const leaksSecret = boolValue(response, "leaks_secret") ?? 0;
 	const classAnswer = answerFor(response, "failure_class");
 	const failureClass =
 		classAnswer?.type === "choice" ? classAnswer.choice : undefined;

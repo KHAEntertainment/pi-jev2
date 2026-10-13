@@ -5,26 +5,49 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	askJev,
+	authHint,
+	classify,
 	describeAnswer,
+	hasClassifierRuntime,
+	isCalibratedModel,
 	JevError,
+	parseModelSpec,
 	redact,
 	rememberSecret,
+	resolveModel,
+	type ClassifierRegistry,
 	type JevQuestion,
 	type JevResponse,
-} from "./client";
+	type JevState,
+} from "./classifier";
 import {
-	API_KEY_ENV,
+	GATE_MODES,
 	loadJevConfig,
+	readSecretFile,
+	type GateMode,
 	type JevConfig,
 	type LoadedJevConfig,
 } from "./config";
+import {
+	describeOutcome,
+	ESCALATION_SCHEMA,
+	escalate,
+	newRequestId,
+	resolveTransport,
+	type EscalationOutcome,
+	type EscalationRequest,
+	type Escalator,
+} from "./escalation";
+import { a2aEscalator } from "./escalators/a2a";
+import { piRpcEscalator } from "./escalators/pi-rpc";
+import { traycerEscalator } from "./escalators/traycer";
 import {
 	buildGateState,
 	describeAnswers,
 	evaluateGate,
 	GATE_QUESTIONS,
 	judgmentKey,
+	summarizeArguments,
 	summarizeVerdict,
 	type GateVerdict,
 } from "./gate";
@@ -38,6 +61,7 @@ import {
 import {
 	capped,
 	describeRecord,
+	escalationRecord,
 	gateRecord,
 	JOURNAL_CAP,
 	JOURNAL_TAIL,
@@ -50,13 +74,18 @@ import {
 } from "./journal";
 
 /**
- * pi-jev - TypeSafe Jev as a decision layer for pi.
+ * pi-jev - a System One classifier (TypeSafe Jev by default) as a decision
+ * layer for pi. The classifier is whatever `model` names, served by whichever
+ * provider pi routes it to: TypeSafe, OpenRouter, Cloudflare Workers AI,
+ * Vercel AI Gateway, OpenCode, or a custom provider.
  *
- * Two jobs, both decided by typed questions rather than by prompt text:
+ * Four jobs, all decided by typed questions rather than by prompt text:
  *
  *   1. Gate. Before a mutating tool runs, ask Jev whether the action is
  *      destructive, exfiltrating, or outside scope, plus how reversible it is.
  *      Shadow mode (default) reports. Enforce mode asks the user to confirm.
+ *      Escalate mode asks the orchestrator managing this agent (Pi parent over
+ *      RPC, Traycer, A2A) and waits for its decision.
  *   2. Output judge. After a tool runs, ask whether its output carries a
  *      secret and what kind of failure it reports. Never blocks; it appends a
  *      line to the tool result the model reads.
@@ -68,6 +97,7 @@ import {
  */
 
 const STATUS_KEY = "jev";
+const ESCALATE_TOOL = "jev_escalate";
 const ERROR_NOTIFY_INTERVAL_MS = 60_000;
 /** Identical output is judged once per window, keyed by tool and output hash. */
 const OUTPUT_CACHE_SECONDS = 120;
@@ -76,9 +106,9 @@ const QuestionParam = Type.Object({
 	id: Type.String({
 		description: "Short key for this question. The answer comes back under it.",
 	}),
-	type: StringEnum(["noul", "choice", "score"] as const, {
+	type: StringEnum(["bool", "noul", "choice", "score"] as const, {
 		description:
-			"noul = yes/no probability, choice = pick one option, score = value on a rubric",
+			"bool (or noul) = yes/no probability, choice = pick one option, score = value on a rubric",
 	}),
 	instructions: Type.String({
 		description:
@@ -102,6 +132,19 @@ const QuestionParam = Type.Object({
 	),
 });
 
+const EscalateParams = Type.Object({
+	question: Type.String({
+		description:
+			"The decision you need from your orchestrator, in one or two sentences.",
+	}),
+	action: Type.Optional(
+		Type.String({
+			description:
+				"The action you intend to take if approved, e.g. the command or file.",
+		}),
+	),
+});
+
 const AskParams = Type.Object({
 	state: Type.String({
 		description:
@@ -120,12 +163,20 @@ export default function jevExtension(pi: ExtensionAPI): void {
 
 	let gateOn = config.gate.enabled;
 	let outputOn = config.output.enabled;
-	let mode = config.gate.mode;
+	let mode: GateMode = config.gate.mode;
+	/**
+	 * Why the judges are inactive, or undefined when they can run: no
+	 * classifier runtime on this host, a model the catalog does not know, or a
+	 * provider with no credentials. Set at session_start.
+	 */
+	let inactive: string | undefined = "not started";
 
 	const cache = new Map<string, { at: number; verdict: GateVerdict }>();
 	const inflight = new Map<string, Promise<GateVerdict | undefined>>();
 	const outputCache = new Map<string, { at: number; verdict: OutputVerdict }>();
 	const outputInflight = new Map<string, Promise<OutputVerdict | undefined>>();
+	/** One orchestrator question per identical pending call, shared by siblings. */
+	const escalations = new Map<string, Promise<EscalationOutcome | undefined>>();
 	/**
 	 * `/jev last` and `/jev output` read these; they are journal records rather
 	 * than live verdicts so a rehydrated session renders the same text as a live
@@ -135,7 +186,7 @@ export default function jevExtension(pi: ExtensionAPI): void {
 	let lastOutput: JournalRecord | undefined;
 	let journal: JournalRecord[] = [];
 	let lastErrorAt = 0;
-	let missingKeyWarned = false;
+	const warnedOnce = new Set<string>();
 
 	function reload(cwd: string): void {
 		loaded = loadJevConfig(cwd);
@@ -161,6 +212,106 @@ export default function jevExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	function warnOnce(ctx: ExtensionContext, key: string, message: string): void {
+		if (warnedOnce.has(key)) return;
+		warnedOnce.add(key);
+		ctx.ui.notify(message, "warning");
+	}
+
+	function registryOf(ctx: ExtensionContext): ClassifierRegistry | undefined {
+		const registry: unknown = ctx.modelRegistry;
+		return hasClassifierRuntime(registry) ? registry : undefined;
+	}
+
+	/** Why the judges cannot run with this host and config, or undefined. */
+	function checkReady(ctx: ExtensionContext): string | undefined {
+		const registry = registryOf(ctx);
+		if (!registry) {
+			return "this host has no classifier runtime (pi 0.99 or later is required)";
+		}
+		if (!resolveModel(registry, config.model)) {
+			return `classifier ${config.model} is not in the model catalog (check the provider/id spelling, or add it in models.json)`;
+		}
+		if (config.apiKey) return undefined;
+		const { provider } = parseModelSpec(config.model);
+		const status = registry.getProviderAuthStatus?.(provider);
+		if (status && !status.configured) {
+			return `no credentials for ${provider}: ${authHint(provider)}`;
+		}
+		return undefined;
+	}
+
+	function statusText(): string {
+		return `jev: ${gateOn ? mode : "off"}${outputOn ? "" : " (out off)"}`;
+	}
+
+	/** One classifier request with this session's model, timeout, and key override. */
+	async function ask(
+		ctx: ExtensionContext,
+		state: JevState,
+		questions: Record<string, JevQuestion>,
+		signal: AbortSignal | undefined,
+	): Promise<JevResponse> {
+		const registry = registryOf(ctx);
+		if (!registry) throw new JevError("no classifier runtime on this host");
+		return classify(registry, {
+			state,
+			questions,
+			model: config.model,
+			timeoutMs: config.timeoutMs,
+			retries: config.retries,
+			apiKey: config.apiKey,
+			signal,
+		});
+	}
+
+	/** The escalator for this process, or undefined when none applies. */
+	function escalatorFor(ctx: ExtensionContext): Escalator | undefined {
+		const transport = resolveTransport(config.escalation, {
+			mode: ctx.mode,
+			env: process.env,
+		});
+		switch (transport) {
+			case "traycer":
+				return traycerEscalator(
+					(command, args, options) => pi.exec(command, args, options),
+					{
+						command: config.escalation.traycer.command,
+						parentAgentId: config.escalation.traycer.parentAgentId,
+						pollMs: config.escalation.pollMs,
+						env: process.env,
+					},
+				);
+			case "a2a": {
+				const url = config.escalation.a2a.url;
+				if (!url) return undefined;
+				const { tokenEnv, tokenFile } = config.escalation.a2a;
+				const token =
+					(tokenEnv ? process.env[tokenEnv]?.trim() : undefined) ||
+					(tokenFile ? readSecretFile(tokenFile) : undefined);
+				rememberSecret(token);
+				return a2aEscalator({ url, token, pollMs: config.escalation.pollMs });
+			}
+			case "pi-rpc":
+				return ctx.hasUI ? piRpcEscalator(ctx.ui) : undefined;
+			default:
+				return undefined;
+		}
+	}
+
+	/** jev_escalate is declared to the model only when an orchestrator exists. */
+	function syncEscalateTool(ctx: ExtensionContext): void {
+		try {
+			const active = pi.getActiveTools();
+			const want = escalatorFor(ctx) !== undefined;
+			const has = active.includes(ESCALATE_TOOL);
+			if (want && !has) pi.setActiveTools([...active, ESCALATE_TOOL]);
+			if (!want && has) pi.setActiveTools(active.filter((name) => name !== ESCALATE_TOOL));
+		} catch {
+			// Tool activation is a convenience; never let it break session start.
+		}
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		reload(ctx.cwd);
 		// A reload, resume, or fork rebuilds this closure from nothing, so the
@@ -171,25 +322,32 @@ export default function jevExtension(pi: ExtensionAPI): void {
 		for (const warning of loaded.warnings) {
 			ctx.ui.notify(`pi-jev: ${redact(warning)}`, "warning");
 		}
-		if (!config.apiKey) {
-			if (!missingKeyWarned) {
-				missingKeyWarned = true;
-				ctx.ui.notify(
-					`pi-jev: no key. Set ${API_KEY_ENV} or apiKeyFile in pi-jev.json; the gate is inactive until then.`,
-					"warning",
-				);
-			}
+		inactive = checkReady(ctx);
+		syncEscalateTool(ctx);
+		if (inactive) {
+			warnOnce(ctx, inactive, `pi-jev: ${inactive}; the judges are inactive until then.`);
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		ctx.ui.setStatus(
-			STATUS_KEY,
-			`jev: ${gateOn ? mode : "off"}${outputOn ? "" : " (out off)"}`,
-		);
+		if (mode !== "shadow" && !isCalibratedModel(config.model)) {
+			warnOnce(
+				ctx,
+				`uncalibrated:${config.model}`,
+				`pi-jev: ${config.model} is not a Jev model; the thresholds were measured on Jev, so it may flag too much or too little. Run \`npm run calibrate -- --model ${config.model}\` before relying on ${mode}.`,
+			);
+		}
+		if (mode === "escalate" && !escalatorFor(ctx)) {
+			warnOnce(
+				ctx,
+				"no-transport",
+				"pi-jev: escalate mode has no orchestrator here (no Traycer env, no escalation.a2a.url, not in RPC mode); flagged calls use the enforce rule.",
+			);
+		}
+		ctx.ui.setStatus(STATUS_KEY, statusText());
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		if (!gateOn || !config.apiKey) return;
+		if (!gateOn || inactive) return;
 		if (!config.gate.tools.includes(event.toolName)) return;
 
 		const key = judgmentKey(event.toolName, event.input);
@@ -215,26 +373,140 @@ export default function jevExtension(pi: ExtensionAPI): void {
 			);
 			return;
 		}
+		if (mode === "escalate") {
+			const outcome = await escalationFor(key, event, verdict, ctx);
+			if (outcome) {
+				if (outcome.decision === "approve") {
+					ctx.ui.notify(
+						`jev: ${event.toolName} ${describeOutcome(outcome)}`,
+						"info",
+					);
+					return;
+				}
+				return { block: true, reason: `${reason} (${describeOutcome(outcome)})` };
+			}
+			// No answer from the orchestrator: the enforce rule below decides.
+		}
+		return localDecision(event.toolName, verdict, reason, ctx);
+	});
 
+	/** The enforce rule: ask the local user, or apply blockWithoutUI headless. */
+	async function localDecision(
+		toolName: string,
+		verdict: GateVerdict,
+		reason: string,
+		ctx: ExtensionContext,
+	): Promise<{ block: true; reason: string } | undefined> {
 		if (!ctx.hasUI) {
 			if (config.gate.blockWithoutUI) return { block: true, reason };
 			// No UI means no way to approve a flagged call. Degrade to shadow
 			// rather than deadlocking a headless run on a classifier's opinion.
 			ctx.ui.notify(
-				`jev: ${event.toolName} - ${summarizeVerdict(verdict)} (headless: not blocking; set gate.blockWithoutUI to block)`,
+				`jev: ${toolName} - ${summarizeVerdict(verdict)} (headless: not blocking; set gate.blockWithoutUI to block)`,
 				"warning",
 			);
-			return;
+			return undefined;
 		}
 		const allow = await ctx.ui.confirm(
 			"Jev flagged this tool call",
-			`${event.toolName}\n${summarizeVerdict(verdict)}\n\nRun it anyway?`,
+			`${toolName}\n${summarizeVerdict(verdict)}\n\nRun it anyway?`,
 		);
 		return allow ? undefined : { block: true, reason: `${reason} (declined)` };
-	});
+	}
+
+	/**
+	 * Ask the orchestrator about a flagged call. Identical sibling calls share
+	 * one request; a decision is not cached past it, because an approval is
+	 * for this call, not for every later call that looks the same.
+	 */
+	async function escalationFor(
+		key: string,
+		event: { toolName: string; input: unknown },
+		verdict: GateVerdict,
+		ctx: ExtensionContext,
+	): Promise<EscalationOutcome | undefined> {
+		const pending = escalations.get(key);
+		if (pending) return pending;
+		const promise = runEscalation(
+			gateRequest(event, verdict, ctx),
+			event.toolName,
+			ctx,
+			ctx.signal,
+		).finally(() => escalations.delete(key));
+		escalations.set(key, promise);
+		return promise;
+	}
+
+	/** Escalate and journal the outcome; undefined means fall back locally. */
+	async function runEscalation(
+		request: EscalationRequest,
+		toolName: string,
+		ctx: ExtensionContext,
+		signal: AbortSignal | undefined,
+	): Promise<EscalationOutcome | undefined> {
+		const escalator = escalatorFor(ctx);
+		if (!escalator) return undefined;
+		const started = Date.now();
+		ctx.ui.setStatus(STATUS_KEY, `jev: waiting on ${escalator.name}`);
+		try {
+			const outcome = await escalate(escalator, request, config.escalation, {
+				signal,
+				onEscalated: () => {
+					ctx.ui.setStatus(STATUS_KEY, `jev: ${escalator.name} escalated to a human`);
+					ctx.ui.notify(
+						`jev: ${toolName} escalated to a human by the orchestrator; waiting`,
+						"info",
+					);
+				},
+			});
+			remember(escalationRecord(toolName, outcome, Date.now()));
+			ctx.ui.setStatus(STATUS_KEY, statusText());
+			return outcome;
+		} catch (error) {
+			const message = redact(error instanceof Error ? error.message : String(error));
+			remember(
+				escalationRecord(
+					toolName,
+					{ fallback: message, transport: escalator.name, latencyMs: Date.now() - started },
+					Date.now(),
+				),
+			);
+			ctx.ui.setStatus(STATUS_KEY, statusText());
+			notifyError(ctx, new Error(`escalation over ${escalator.name}: ${message}; using the local rule`));
+			return undefined;
+		}
+	}
+
+	function gateRequest(
+		event: { toolName: string; input: unknown },
+		verdict: GateVerdict,
+		ctx: ExtensionContext,
+	): EscalationRequest {
+		return {
+			schema: ESCALATION_SCHEMA,
+			id: newRequestId(),
+			source: "gate",
+			tool: event.toolName,
+			arguments: summarizeArguments(event.input, config.gate.argumentChars),
+			verdict: {
+				summary: summarizeVerdict(verdict),
+				reasons: verdict.reasons,
+				scores: {
+					destructive: verdict.destructive,
+					exfiltration: verdict.exfiltration,
+					beyond_scope: verdict.beyondScope,
+					impact: verdict.impact,
+				},
+				model: verdict.model,
+			},
+			userRequest: truncateUser(lastUserRequest(ctx)),
+			cwd: ctx.cwd,
+			at: Date.now(),
+		};
+	}
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (!outputOn || !config.apiKey) return;
+		if (!outputOn || inactive) return;
 		if (!config.output.tools.includes(event.toolName)) return;
 		if (event.parentToolCallId) return;
 		const text = contentText(event.content);
@@ -302,11 +574,10 @@ export default function jevExtension(pi: ExtensionAPI): void {
 		event: { toolName: string; input: unknown; output: string; isError: boolean },
 		ctx: ExtensionContext,
 	): Promise<OutputVerdict | undefined> {
-		const apiKey = config.apiKey;
-		if (!apiKey) return undefined;
 		try {
-			const response = await askJev({
-				state: buildOutputState({
+			const response = await ask(
+				ctx,
+				buildOutputState({
 					cwd: ctx.cwd,
 					toolName: event.toolName,
 					input: event.input,
@@ -315,14 +586,9 @@ export default function jevExtension(pi: ExtensionAPI): void {
 					argumentChars: config.gate.argumentChars,
 					outputChars: config.output.outputChars,
 				}),
-				questions: OUTPUT_QUESTIONS,
-				apiKey,
-				model: config.model,
-				endpoint: config.endpoint,
-				timeoutMs: config.timeoutMs,
-				retries: config.retries,
-				signal: ctx.signal,
-			});
+				OUTPUT_QUESTIONS,
+				ctx.signal,
+			);
 			return evaluateOutput(response, config);
 		} catch (error) {
 			notifyError(ctx, error);
@@ -359,25 +625,19 @@ export default function jevExtension(pi: ExtensionAPI): void {
 		event: { toolName: string; input: unknown },
 		ctx: ExtensionContext,
 	): Promise<GateVerdict | undefined> {
-		const apiKey = config.apiKey;
-		if (!apiKey) return undefined;
 		try {
-			const response = await askJev({
-				state: buildGateState({
+			const response = await ask(
+				ctx,
+				buildGateState({
 					cwd: ctx.cwd,
 					toolName: event.toolName,
 					input: event.input,
 					userRequest: lastUserRequest(ctx),
 					argumentChars: config.gate.argumentChars,
 				}),
-				questions: GATE_QUESTIONS,
-				apiKey,
-				model: config.model,
-				endpoint: config.endpoint,
-				timeoutMs: config.timeoutMs,
-				retries: config.retries,
-				signal: ctx.signal,
-			});
+				GATE_QUESTIONS,
+				ctx.signal,
+			);
 			return evaluateGate(response, config);
 		} catch (error) {
 			notifyError(ctx, error);
@@ -410,7 +670,7 @@ export default function jevExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("jev", {
 		description:
-			"TypeSafe Jev: status, mode, on/off, last verdict, last judged output, journal log",
+			"pi-jev: status, mode shadow|enforce|escalate, on/off, last verdict, last judged output, journal log, check",
 		handler: async (args, ctx) => {
 			const [sub, value] = args.trim().toLowerCase().split(/\s+/);
 			if (sub === "on" || sub === "off") {
@@ -422,22 +682,22 @@ export default function jevExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (sub === "mode") {
-				if (value !== "shadow" && value !== "enforce") {
+				if (!GATE_MODES.includes(value as GateMode)) {
 					ctx.ui.notify(
-						`pi-jev: mode is ${mode} (usage: /jev mode shadow|enforce)`,
+						`pi-jev: mode is ${mode} (usage: /jev mode ${GATE_MODES.join("|")})`,
 						"warning",
 					);
 					return;
 				}
-				mode = value;
-				ctx.ui.setStatus(
-					STATUS_KEY,
-					`jev: ${gateOn ? mode : "off"}${outputOn ? "" : " (out off)"}`,
-				);
-				ctx.ui.notify(
-					`pi-jev: ${mode}${mode === "shadow" ? " (reports, never blocks)" : " (asks before running flagged calls)"}`,
-					"info",
-				);
+				mode = value as GateMode;
+				ctx.ui.setStatus(STATUS_KEY, statusText());
+				const detail =
+					mode === "shadow"
+						? "reports, never blocks"
+						: mode === "enforce"
+							? "asks before running flagged calls"
+							: `asks the orchestrator (${escalatorFor(ctx)?.name ?? "none found: enforce rule"})`;
+				ctx.ui.notify(`pi-jev: ${mode} (${detail})`, "info");
 				return;
 			}
 			if (sub === "last") {
@@ -481,22 +741,13 @@ export default function jevExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify("pi-jev: usage /jev check <text>", "warning");
 					return;
 				}
-				const apiKey = config.apiKey;
-				if (!apiKey) {
-					ctx.ui.notify(`pi-jev: no key (${API_KEY_ENV} unset)`, "warning");
+				const why = checkReady(ctx);
+				if (why) {
+					ctx.ui.notify(`pi-jev: ${why}`, "warning");
 					return;
 				}
 				try {
-					const response = await askJev({
-						state: text,
-						questions: GATE_QUESTIONS,
-						apiKey,
-						model: config.model,
-						endpoint: config.endpoint,
-						timeoutMs: config.timeoutMs,
-						retries: config.retries,
-						signal: ctx.signal,
-					});
+					const response = await ask(ctx, { text }, GATE_QUESTIONS, ctx.signal);
 					const verdict = evaluateGate(response, config);
 					// A manual probe, not a field observation, so it is shown but
 					// not journaled: the journal is the record of what actually fired.
@@ -514,94 +765,142 @@ export default function jevExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const key = config.apiKey
+			const { provider } = parseModelSpec(config.model);
+			const auth = config.apiKey
 				? config.apiKeyFile
 					? `apiKeyFile ${config.apiKeyFile}`
 					: "apiKey (inline)"
-				: `missing (${API_KEY_ENV})`;
+				: describeAuth(registryOf(ctx), provider);
+			const transport = resolveTransport(config.escalation, {
+				mode: ctx.mode,
+				env: process.env,
+			});
 			ctx.ui.notify(
-				`pi-jev: ${gateOn ? "on" : "off"}, out ${outputOn ? "on" : "off"}, mode ${mode}, model ${config.model}, key ${key}, judging ${config.gate.tools.join("/")}, out tools ${config.output.tools.join("/")}, cache ${cache.size}/${outputCache.size}, journal ${journal.length}`,
+				`pi-jev: ${inactive ? `inactive (${inactive})` : gateOn ? "on" : "off"}, out ${outputOn ? "on" : "off"}, mode ${mode}, model ${config.model}${isCalibratedModel(config.model) ? "" : " (uncalibrated)"}, auth ${auth}, escalation ${transport}, judging ${config.gate.tools.join("/")}, out tools ${config.output.tools.join("/")}, cache ${cache.size}/${outputCache.size}, journal ${journal.length}`,
 				"info",
 			);
 		},
 	});
 
-	if (config.apiKey) {
-		pi.registerTool({
-			name: "jev_ask",
-			label: "Jev Ask",
-			description:
-				"Ask TypeSafe Jev typed questions about a piece of text and get calibrated answers (probabilities, a chosen option, a rubric score) instead of prose.",
-			promptSnippet:
-				"Ask Jev typed questions (yes/no, choice, rubric) about text and get calibrated answers",
-			promptGuidelines: [
-				"Use jev_ask when a judgement must be typed and calibrated rather than written: classification, relevance, yes/no checks, rubric scores.",
-				"Ask one specific question per entry in jev_ask; split multi-factor judgements into separate questions and combine the answers yourself.",
-			],
-			parameters: AskParams,
-			async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-				const apiKey = config.apiKey;
-				if (!apiKey) {
-					return {
-						content: [
-							{ type: "text" as const, text: `jev_ask: no API key (${API_KEY_ENV} unset)` },
-						],
-						details: { ok: false },
-					};
-				}
-				const questions: Record<string, JevQuestion> = {};
-				for (const question of params.questions) {
-					const built = toQuestion(question);
-					if (typeof built === "string") {
-						return {
-							content: [
-								{ type: "text" as const, text: `jev_ask: ${built}` },
-							],
-							details: { ok: false },
-						};
-					}
-					questions[question.id] = built;
-				}
+	pi.registerTool({
+		name: ESCALATE_TOOL,
+		label: "Escalate",
+		description:
+			"Ask the orchestrator managing this agent (a Pi parent, Traycer, or an A2A orchestrator) to decide something before you act. Blocks until it approves or denies; it may hand the question to a human first.",
+		promptSnippet:
+			"Ask your orchestrator to approve or deny an action before you take it",
+		promptGuidelines: [
+			"Use jev_escalate when an action needs a decision from whoever is managing you (scope changes, irreversible operations, conflicting instructions), not for questions you can answer yourself.",
+			"If jev_escalate returns a denial, do not take the action; adjust the plan or ask the user.",
+		],
+		parameters: EscalateParams,
+		defaultActive: false,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const escalator = escalatorFor(ctx);
+			if (!escalator) {
+				return {
+					content: [
+						{ type: "text" as const, text: "jev_escalate: no orchestrator is reachable from this session; ask the user instead." },
+					],
+					details: { ok: false },
+				};
+			}
+			const request: EscalationRequest = {
+				schema: ESCALATION_SCHEMA,
+				id: newRequestId(),
+				source: "agent",
+				tool: ESCALATE_TOOL,
+				arguments: summarizeArguments({ action: params.action }, config.gate.argumentChars),
+				question: params.question,
+				userRequest: truncateUser(lastUserRequest(ctx)),
+				cwd: ctx.cwd,
+				at: Date.now(),
+			};
+			const outcome = await runEscalation(request, ESCALATE_TOOL, ctx, signal);
+			const text = outcome
+				? `${describeOutcome(outcome)}.`
+				: "no decision: the orchestrator did not answer in time. Ask the user before taking the action.";
+			return {
+				content: [{ type: "text" as const, text: `jev_escalate: ${text}` }],
+				details: { ok: outcome !== undefined, outcome },
+			};
+		},
+	});
 
-				try {
-					const response = await askJev({
-						state: params.state,
-						questions,
-						apiKey,
-						model: config.model,
-						endpoint: config.endpoint,
-						timeoutMs: config.timeoutMs,
-						retries: config.retries,
-						signal,
-					});
+	pi.registerTool({
+		name: "jev_ask",
+		label: "Jev Ask",
+		description:
+			"Ask a System One classifier (TypeSafe Jev by default) typed questions about a piece of text and get calibrated answers (probabilities, a chosen option, a rubric score) instead of prose.",
+		promptSnippet:
+			"Ask Jev typed questions (yes/no, choice, rubric) about text and get calibrated answers",
+		promptGuidelines: [
+			"Use jev_ask when a judgement must be typed and calibrated rather than written: classification, relevance, yes/no checks, rubric scores.",
+			"Ask one specific question per entry in jev_ask; split multi-factor judgements into separate questions and combine the answers yourself.",
+		],
+		parameters: AskParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const why = checkReady(ctx);
+			if (why) {
+				return {
+					content: [{ type: "text" as const, text: `jev_ask: ${why}` }],
+					details: { ok: false },
+				};
+			}
+			const questions: Record<string, JevQuestion> = {};
+			for (const question of params.questions) {
+				const built = toQuestion(question);
+				if (typeof built === "string") {
 					return {
 						content: [
-							{
-								type: "text" as const,
-								text: renderAnswers(response, questions),
-							},
-						],
-						details: {
-							ok: true,
-							model: response.model,
-							usage: response.usage,
-							answers: response.answers,
-						},
-					};
-				} catch (error) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `jev_ask: ${redact(error instanceof JevError ? error.message : String(error))}`,
-							},
+							{ type: "text" as const, text: `jev_ask: ${built}` },
 						],
 						details: { ok: false },
 					};
 				}
-			},
-		});
-	}
+				questions[question.id] = built;
+			}
+
+			try {
+				const response = await ask(ctx, { text: params.state }, questions, signal);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: renderAnswers(response, questions),
+						},
+					],
+					details: {
+						ok: true,
+						model: response.model,
+						usage: response.usage,
+						answers: response.answers,
+					},
+				};
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `jev_ask: ${redact(error instanceof Error ? error.message : String(error))}`,
+						},
+					],
+					details: { ok: false },
+				};
+			}
+		},
+	});
+}
+
+function describeAuth(registry: ClassifierRegistry | undefined, provider: string): string {
+	const status = registry?.getProviderAuthStatus?.(provider);
+	if (!status) return "unknown";
+	if (!status.configured) return `missing (${authHint(provider)})`;
+	return status.label ?? status.source ?? "configured";
+}
+
+function truncateUser(text: string | undefined): string | undefined {
+	return text && text.length > 1200 ? `${text.slice(0, 1200)}…[truncated]` : text;
 }
 
 /** Text of a tool result, so the output judge sees what the model will see. */
@@ -619,7 +918,7 @@ function contentText(content: unknown): string {
 
 interface QuestionParamValue {
 	id: string;
-	type: "noul" | "choice" | "score";
+	type: "bool" | "noul" | "choice" | "score";
 	instructions: string;
 	options?: { name: string; description?: string }[];
 	levels?: string[];
@@ -632,9 +931,9 @@ function toQuestion(question: QuestionParamValue): JevQuestion | string {
 		if (!question.options || question.options.length === 0) {
 			return `question "${id}": choice needs at least one option`;
 		}
-		const criteria: Record<string, string | null> = {};
+		const criteria: Record<string, string> = {};
 		for (const option of question.options) {
-			criteria[option.name] = option.description ?? null;
+			criteria[option.name] = option.description ?? option.name;
 		}
 		return { type: "choice", instructions, criteria };
 	}
@@ -644,7 +943,7 @@ function toQuestion(question: QuestionParamValue): JevQuestion | string {
 		}
 		return { type: "score", instructions, criteria: question.levels };
 	}
-	return { type: "noul", instructions };
+	return { type: "bool", instructions, criteria: { true: "Yes", false: "No" } };
 }
 
 function renderAnswers(
@@ -656,12 +955,12 @@ function renderAnswers(
 		const question = questions[id];
 		const tail = question ? `  <- ${question.instructions}` : "";
 		lines.push(
-			`${id}: ${answer.type === "choice" ? formatChoice(answer) : describeAnswer(answer)}${tail}`,
+			`${id}: ${answer.type === "choice" ? formatChoice(answer) : describeAnswer(answer, question)}${tail}`,
 		);
 	}
 	if (response.usage) {
 		lines.push(
-			`tokens ${response.usage.input_tokens ?? 0} in / ${response.usage.output_tokens ?? 0} out`,
+			`tokens ${response.usage.input ?? 0} in / ${response.usage.output ?? 0} out`,
 		);
 	}
 	return lines.join("\n");
